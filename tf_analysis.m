@@ -1,0 +1,436 @@
+%%%%% Goals %%%%%%
+% - Prepare data for induced analysis (subtract ERP, Badtrials)
+% - TF transform
+% - Convert to images, smooth
+% - GLM (main effect / interaction)
+% - Contrast
+% - Convert contrast images to fieldtrip file
+% - Cluster-based permutation test
+%%%%% Requirements %%%%%%
+% - SPM
+% - Fieldtrip
+% - Preprocessed, cleaned & Epoched data
+%%%%%              %%%%%%
+% Script can be used under CC0, AvL, NNU Berlin
+
+clear all
+%% Set up locations, subjects etc.
+
+orig_dir= '/media/avl/X/SBL/';
+study_dir = '/home/avl/SBL/';
+analysis_dir='/home/avl/SBL/analysis/';
+resultsdir ='/home/avl/SBL/results/';
+
+prefix='beTdlhM_'; %%%%%%%%%%%%%%%% This is baselined (we don't actually want that, but I don't have the file without b!)
+subj_code='sub-';
+
+subjects=[1:17,20,23]; % bad subjects excluded!
+% subjects=[1];
+file_ext  = '_SBL';% filename extension for epochs, e.g. _f1_locked
+
+%%%%% OPTIONAL %%%%%%%%
+%% Copy relevant data to new directory (SPM is slow when read/write from external disk)
+mkdir(study_dir)
+% for isub=subjects
+%     subj_ID = sprintf('%02d',isub); % string of subject
+%     subj_dir = fullfile(orig_dir, [subj_code subj_ID ],'preprocessed/');
+%     new_subj_dir=fullfile(study_dir, [subj_code subj_ID]);
+%     mkdir(new_subj_dir)
+%     copyfile([subj_dir prefix '*'],[new_subj_dir]) % copy data to new directory
+%     copyfile([subj_dir 'bad*'],[new_subj_dir]) % copy bad trials
+% end
+%%%%% OPTIONAL %%%%%%%%
+
+%% Prepare data for induced analysis (subtract ERP, Badtrials)
+for isub=subjects;    disp(['======= subject ' num2str(isub) ' ======='])
+    subj_ID = sprintf('%02d',isub); % string of subject
+    subj_dir=fullfile(study_dir, [subj_code subj_ID]);
+    cd(subj_dir)
+    
+    target_file = [prefix subj_code subj_ID file_ext];
+    D = spm_eeg_load(target_file);
+   
+    % remove bad trials: Do this first, SPM will reshuffle trials!
+    % If you want to analyse changes over time, you will have to mark each
+    % trials' position in time now - else it will be too late :(
+    
+    load(['badtrials_' subj_code subj_ID file_ext])
+    D = D.badtrials(badtrials, 1); % mark badtrials as 'bad'
+    S=[];
+    S.D=D;
+    D=spm_eeg_remove_bad_trials(S);
+    
+    % Be cautious here: Because data has been reshuffled, only trust the
+    % SPM output order and condition labelling!
+    
+    cons=char(D.conditions); % read out condition labels
+    fvec=str2num(cons(:,[1:2]));% Fieldtrip uses data.trialinfo as 'double', I try to keep it similar
+    catch_resp=find(fvec==33);
+    D = D.badtrials(catch_resp, 1); % mark catch_trials as bad.
+    S=[];
+    S.D=D;
+    D=spm_eeg_remove_bad_trials(S);
+    
+    %% Subtract ERP for induced analysis
+    
+     S = [];
+     S.D   = D;
+     S.outfile = ['i' fname(D)];
+     iD = spm_eeg_copy(S);
+      
+    cons=char(D.conditions); % Read this out anew! Always! SPM changes trialorder!
+    
+% When it is four different conditions just manually name them
+    f{1}=find(ismember(str2num(cons(:,1:2)),[11]));
+    f{2}=find(ismember(str2num(cons(:,1:2)),[12]));
+    f{3}=find(ismember(str2num(cons(:,1:2)),[21]));
+    f{4}=find(ismember(str2num(cons(:,1:2)),[22]));
+    for f1_cond=1:4
+        trial_idx = f{f1_cond};
+        erp = mean(D(:,:,trial_idx),3);
+        iD(:,:,trial_idx) = D(:,:,trial_idx) - repmat(erp, [1 1 length(trial_idx)]);
+    end  
+    save(iD);
+            D=iD;
+            clear iD;
+    
+    %% Induced power f2 locked
+    % Some notes
+    % - There are many ways to do TF transform. Google them and look at
+    % some presentations where people have done Morlet Wavelet, Hilbert,
+    % Slepian based multitaper etc. and have compared them. Pick a way that
+    % you like and do it. We will do Morlet Wavelets here.
+    % - If you are going into higher frequencies, do multitaper.
+    % - Tapers: They are a way to sharpen the TF transform by a type of
+    % smoothing. Sounds weird, but makes sense when you look at the images.
+    % There are many ways of tapering, usually it is done by a sliding
+    % window. Inside this window is the function we are using for tapering 
+    % (imagine someone is sliding a function in a finite window over your
+    % data). The windowed function are for example "Hann", "Blackman" or
+    % "Hamming"(fun fact: "Hann" is often miscalled "Hanning" - but the guy 
+    % was actually called "von Hann"). I recommend doing "Hanning", which 
+    % really hould be called "von Hann". It has a good roll-off / ripple.
+    % - The taper window is what is specified by "ncycles" or in fieldtrip
+    % and especially when using higher frequencies is typically fixed.
+    % ncycles means that the window will be as long as the number of cycles
+    % of the specific frequency. This means you will need a long time for
+    % low frequencies before and after your window of interest. If you are 
+    % looking at alpha (10 Hz), if you want 5 cycles taper length, you will
+    % need 500ms before and after your window of interest. So your epoch
+    % needs to be long enough! Otherwise there won't be an estimate for low
+    % frequencies. There are ways of getting around this issue by padding
+    % with zeros. But it is not a good solution, better cut your epochs 
+    % longer. 
+    % - You will also have to choose a frequency and time resolution. I
+    % recommend to do it first with a low resolution. For both time and
+    % frequency you can always increase, but this might take a whole
+    % weekend and fill your harddrive very quickly (My MEG studies easily
+    % have 2 TB of TF transforms for all different analyses).
+    
+    S=[];
+    S.D=D;
+    S.frequencies=[6:2:40];
+    S.timewin=[-99 599]; % This is in ms - always double check! SPM versions and fieldtrip are inconsistent!
+    S.method = 'morlet';
+    
+    S.phase = 0; % If you want to have the phase - as imaginary part of complex number. Leave this for now.
+    S.settings.ncycles = 3;% Number of cycles. I prefer 7 (at least 5), but because of the short window not possible!
+    S.settings.subsample = 10; % number*(1000/fsample) = steps in ms
+    
+    S.prefix='f6-2-40';
+    D=spm_eeg_tf(S);
+end
+
+%% Inspect the data
+% I was asked, how can you check your data at each step. It is easy, but
+% better be done in fieldtrip. Let's check the last subject's TF transform
+% for now. If you want to check overall TF effects without stats (e.g.
+% figure 2 in von Lautz et al.,2017) this is where you could also just
+% average over subjects with ft_timelockanalysis per subject and
+% ft_timelockgrandaverage for the resulting data.
+
+data=fttimelock(D); % input the file D here you want to inspect
+
+cfg=[];
+cfg.layout='biosemi64.lay'; % Put in the layout. Make sure you have real fieldtrip in your path or you will likely get errors
+cfg.colorbar='yes';
+cfg.baseline='yes';
+% cfg.zlim=[-.2 .2];
+cfg.colormap=jet;
+cfg.baselinetype='relchange';
+ft_multiplotTFR(cfg,data)
+
+%% BL correction on the single trial TF transformed data (Optional)
+% Take a long Baseline correction on TF data. Best for a fixation interval
+% of something like 0.5-1 second. And maybe do not go to 0, but like -.05
+for isub=subjects;    disp(['======= BL correct subject ' num2str(isub) ' ======='])   
+    subj_ID = sprintf('%02d',isub); % string of subject
+    subj_dir=fullfile(study_dir, [subj_code subj_ID]);
+    cd(subj_dir)
+    target_file = ['f6-2-40tf_irr' prefix subj_code subj_ID file_ext];% You will have to put in the new prefixes or keep a running tally
+    D = spm_eeg_load(target_file);  
+    S=[];
+    S.method='Rel';% Relative change, there are other ways, look it up.
+    S.timewin=[-80 0];% This is very short! I do not recommend.
+    S.D=D;
+    S.prefix='r';
+    D=spm_eeg_tf_rescale(S);   
+end
+%% Convert to images and smooth
+smoothfwhm =[3 300 0];% This means 3Hz and 300ms smoothing kernel full width half max.
+for isub=subjects; disp(['%%%%%%%% Convert and smooth SUBNUM = ' num2str(isub) '%%%%%%%%%%'])
+    subj_ID = sprintf('%02d',isub); % string of subject
+    subj_dir=fullfile(study_dir, [subj_code subj_ID]);
+    cd(subj_dir)
+    target_file = ['rf6-2-40tf_irr' prefix subj_code subj_ID file_ext];% this includes BLcorrection
+    D=spm_eeg_load(target_file);
+    
+    S=[];
+    S.D=D;
+    S.mode    = 'time x frequency x chan';
+    S.channels='EEG';
+    S.prefix='i';
+    S.save=1;
+    images=spm_eeg_convert2images(S);
+    clear matlabbatch
+    matlabbatch{1}.spm.spatial.smooth.data = images; %spm_select('ExtFPListRec',smoothdir, [img_ID '.*'], [1 inf]);
+    matlabbatch{1}.spm.spatial.smooth.fwhm = smoothfwhm;
+    matlabbatch{1}.spm.spatial.smooth.im = 0;
+    matlabbatch{1}.spm.spatial.smooth.prefix = 's';
+    output_list = spm_jobman('run',matlabbatch);
+end
+%% 1st level GLM
+for isub=subjects; disp(['%%%%%%%% 1st level GLM for SUBNUM = ' num2str(isub) '%%%%%%%%%%'])
+    subj_ID = sprintf('%02d',isub); % string of subject
+    subj_dir=fullfile(study_dir, [subj_code subj_ID]);
+    target_file = ['irf6-2-40tf_irr' prefix subj_code subj_ID file_ext];
+    model_ID=['irf6-2-40tf_irr' 'twofactorinteraction/'];% Include information about your model here
+    img_prefix='scondition*';
+    stats_dir=[analysis_dir model_ID subj_ID];
+    mkdir(stats_dir);
+    cd([subj_dir '/' target_file]); 
+    
+    % select all images
+    match   = dir(img_prefix);
+    sel_img = spm_select('ExtList',[subj_dir '/' target_file], img_prefix, inf);
+    
+    % extract condition codes from filenames
+    tmp   = regexp(cellstr(sel_img), ['(?<=' img_prefix '_)\d+'], 'match');
+    conds = str2double([tmp{:}])';
+    cons=num2str(conds); 
+    
+    %intensity
+    f_1=ismember(str2num(cons(:,1:2)),[11 21]);
+    f_2=ismember(str2num(cons(:,1:2)),[12 22]);   
+    fuerza=f_1+f_2*2;
+    %regime
+    r_1=ismember(str2num(cons(:,1:2)),[11 12]);
+    r_2=ismember(str2num(cons(:,1:2)),[21 22]);   
+    regime=r_1+r_2*2;
+    
+    clear matlabbatch
+    
+    matlabbatch{1}.spm.stats.factorial_design.dir = {stats_dir};
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(1).name = 'fuerza';
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(1).dept = 1;%was on 1
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(1).variance = 0;%equal variance assumption - sphericity
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(1).gmsca = 0;
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(1).ancova = 0;
+    
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(2).name = 'regime';
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(2).dept = 1;%was on 1
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(2).variance = 0;%equal variance assumption - sphericity
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(2).gmsca = 0;
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fac(2).ancova = 0;
+    
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fsuball.fsubject(isub).scans = cellstr(sel_img);
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.fsuball.fsubject(isub).conds = [fuerza, regime];
+%     matlabbatch{1}.spm.stats.factorial_design.des.fblock.fsuball.fsubject(isub).conds = [f1];
+   
+%     matlabbatch{1}.spm.stats.factorial_design.des.fblock.maininters{1}.fmain.fnum = 1;
+    %         matlabbatch{1}.spm.stats.factorial_design.des.fblock.maininters{2}.fmain.fnum = 2;
+    %         matlabbatch{1}.spm.stats.factorial_design.des.fblock.maininters{3}.fmain.fnum = 3;
+    matlabbatch{1}.spm.stats.factorial_design.des.fblock.maininters{1}.inter.fnums = [1 2];
+    
+    matlabbatch{1}.spm.stats.factorial_design.cov = struct('c', {}, 'cname', {}, 'iCFI', {}, 'iCC', {});
+    matlabbatch{1}.spm.stats.factorial_design.masking.tm.tm_none = 1;
+    matlabbatch{1}.spm.stats.factorial_design.masking.im = 1;%implicit mask, 0 means me defining, below empty means no mask, 1 means spm default
+    matlabbatch{1}.spm.stats.factorial_design.masking.em = {''};%means
+    matlabbatch{1}.spm.stats.factorial_design.globalc.g_omit = 1;
+    matlabbatch{1}.spm.stats.factorial_design.globalm.gmsca.gmsca_no = 1;
+    matlabbatch{1}.spm.stats.factorial_design.globalm.glonorm = 1;
+    
+    output_list = spm_jobman('run',matlabbatch);
+    cd(stats_dir);
+    load('SPM.mat');
+    
+    spm_spm(SPM);
+end
+%%
+for isub=subjects; disp(['%%%%%%%% SUBNUM = ' num2str(isub) '%%%%%%%%%%'])
+   subj_ID = sprintf('%02d',isub); % string of subject
+    subj_dir=fullfile(study_dir, [subj_code subj_ID]);
+    model_ID=['irf6-2-40tf_irr' 'twofactorinteraction/'];% Include information about your model here
+    stats_dir=[analysis_dir model_ID subj_ID];
+    cd(stats_dir);
+    
+    load('SPM.mat');
+    
+    if isfield(SPM,'xCon')
+        SPM = rmfield(SPM,'xCon');
+    end
+    cname       = 'Total_Power';
+    c           = [1 1 1 1];
+    SPM.xCon(1) = spm_FcUtil('Set',cname,'T','c',c',SPM.xX.xKXs);
+   
+    % double check contrasts with SPM design matrix
+    
+    cname       = 'Regime';
+    c           = [1 1 -1 -1];
+    SPM.xCon(2) = spm_FcUtil('Set',cname,'T','c',c',SPM.xX.xKXs);
+%     
+    cname       = 'high v low';
+    c           = [1 -1 1 -1];
+    SPM.xCon(3) = spm_FcUtil('Set',cname,'T','c',c',SPM.xX.xKXs);
+%     
+   
+    spm_contrasts(SPM);
+    clear matlabbatch
+end
+
+%% Transform images into fieldtrip dataset to make permutation test
+
+img_name = 'con_0003.nii';      % contrast image name SPM12 .nii SPM8 .img
+model_ID=['irf6-2-40tf_irr' 'twofactorinteraction/']; % name of the specific model
+model_path=[analysis_dir model_ID];
+
+% We use a little trick in the following: take an SPM file, convert it to
+% fieldtrip, and then copy the subject images as data points into the ft 
+% data structure. The dataset we test it against is the same, just filled 
+% with zeros. Otherwise getting header info etc. converted is a pain.
+ref_file=[study_dir 'sub-01/' 'rf6-2-40tf_irr' prefix subj_code '01' file_ext '.mat'];
+
+N = length(subjects);
+D = spm_eeg_load(ref_file);
+
+% set default eeg locations .. just to be on the save side
+S = [];
+S.D = D;
+S.task = 'defaulteegsens';
+S.save = 0;
+D = spm_eeg_prep(S);
+dat = D.fttimelock();      % transform SPM data set into fieldtrip data set
+cd(model_path);   % change into directory where all the contrast images are located
+dir_list = dir;  % list all the folders in that directory
+
+% get the directories that hold images of desired models
+idx_model_dir = ~cellfun(@isempty, regexp({dir_list.name}, '[0-9]'));
+model_dir = {dir_list(idx_model_dir).name};
+
+% read one image to get default dimensions of data
+% actdir = fullfile(model_dir{1}, statsdir, img_name); % for more models
+actdir = fullfile(model_dir{1}, img_name);
+
+actimg = ft_read_mri(actdir, 'dataformat', 'nifti_spm'); % SPM 12
+cfg=[];
+cfg.channel='EEG';
+dat=ft_selectdata(cfg,dat);
+dat.powspctrm = zeros(N, length(dat.label), actimg.dim(1), actimg.dim(2));
+dat.dimord='rpt_chan_freq_time';
+%% 
+for isub=1:N disp(['======== subject ' num2str(isub) ' =========='])
+      
+    subj_dir = model_dir{~cellfun(@isempty, regexp(model_dir, sprintf('%02d',subjects(isub))))}; %the number 1 exists everywhere?
+%         actdir = fullfile(spmdatadir,model_dir{isub}, statsdir, img_name);
+       actdir = fullfile(model_path,model_dir{isub}, img_name);
+       actimg = ft_read_mri(actdir, 'dataformat', 'nifti_spm'); % SPM 12
+       dat.powspctrm(isub,:,:,:)=permute(actimg.anatomy, [3 1 2]);
+end
+
+% create data set of same size as observed data with only zeros (null-hypothesis)
+zero_dat = dat;
+zero_dat.powspctrm = zeros(size(dat.powspctrm));
+
+%% set configuration for permutation test
+
+% Path problems with SPM12 and fieldtrip are prevalent. If so, set to
+% fieldtrip path
+restoredefaultpath
+% addpath /home/avl/Documents/MATLAB/fieldtrip-20181127
+addpath /home/avl/Documents/MATLAB/fieldtrip-20161012
+ft_defaults
+
+cluster_defining_threshold = 0.05;  % alpha-level that is used to define a cluster
+min_neighbours             = 0;      % minimal amount of neighbouring channels that have to share an effect to consider 
+                                     % the effect as a spatially coherent cluster
+permutation_threshold      = 0.05;   % probability of random occurence of clusters in permutation sample 
+                                     % that exhibit a larger effect than the observed data
+num_permutation            = 500;    % number of random samples that should be generated by shuffling the data labels
+
+% Just an example set of channels, only use a priori channels! Otherwise
+% extreme p-Hacking! Really be cautious when subselecting channels,
+% latency, frequency, number of minimum neighbours - every analysis has to
+% have an a priori hypothesis, otherwise you will not have real stats! You
+% can find anything by running enough tests.
+right_front_ext={'Fpz', 'Fp2', 'AF8', 'AF4', 'AFz', 'Fz', 'F2', 'F4', 'F6', 'F8'};
+
+% Establish neighbourhood structure for correction over space
+cfg=[];
+    cfg.method='template';
+    cfg.template='/home/avl/Documents/MATLAB/fieldtrip-20141231/template/neighbours/biosemi64_neighb.mat';
+    cfg.layout='biosemi64.lay';
+    cfg.feedback='no';
+    neighbours=ft_prepare_neighbours(cfg, dat);
+
+cfg = [];
+cfg.neighbours       = neighbours;
+cfg.channel          = 'all';
+cfg.latency          = [0.1 0.2];
+cfg.frequency        = 'all';
+cfg.method           = 'montecarlo';
+% config for cfg.method - cluster-defining statisitics
+cfg.statistic        = 'ft_statfun_depsamplesT';
+cfg.correctm         = 'cluster';
+cfg.clusteralpha     = cluster_defining_threshold;        
+cfg.clusterstatistic = 'maxsum'; %'maxsum', 'maxsize', 'wcm' (default = 'maxsum')
+cfg.minnbchan        = min_neighbours;
+% config for statistics of permutation test
+cfg.computecritval   = 'no';
+cfg.tail             = 0; 
+cfg.clustertail      = 0;
+cfg.alpha            = permutation_threshold;   % FWE correction threshold 
+cfg.numrandomization = num_permutation;
+% cfg.correcttail      = 'prob'; % correct for the fact that only a one-tailed test is implemented by the permutation test
+
+% create the right design: here, a comparison vs. a zero-data set (i.e. paired t-test with a null-condition)
+design = zeros(2,2*N);
+for i = 1:N
+  design(1,i) = i;
+end
+for i = 1:N
+  design(1,N+i) = i;
+end
+design(2,1:N)        = 1;
+design(2,N+1:2*N)    = 2;
+
+cfg.design   = design;
+cfg.uvar     = 1;                  % row number of design that contains the labels of the UOs (subjects or trials)
+cfg.ivar     = 2;                  % row number of the design that contains the labels of the conditions that must be 
+                                   % compared. The labels are the numbers 1 and 2.
+stat = ft_freqstatistics(cfg, dat, zero_dat);
+randnum=randi(1000);
+save([resultsdir 'con3_-0-05_nb0_500_' num2str(randnum)],'stat','cfg');
+%% Plot the permutation clusters
+plot_permutation_clusters(stat,2)
+%% 
+cfg=[];
+cfg.parameter='stat';
+cfg.layout='biosemi64.lay';
+cfg.colormap=jet;
+% cfg.zlim=[-2 2];
+cfg.colorbar='yes';
+% cfg.xlim=[-1.2 0.2]
+ft_multiplotTFR(cfg,stat)
+
+xlabel('time (s)')
+ylabel('frequency (Hz)')
